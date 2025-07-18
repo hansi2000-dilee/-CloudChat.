@@ -1,109 +1,219 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { auth, database } from '../firebase';
-import { signOut } from 'firebase/auth';
+import { signOut, onAuthStateChanged } from 'firebase/auth';
 import { useNavigate } from 'react-router-dom';
-import { ref, push, onValue } from 'firebase/database';
+import { ref, push, set, onValue, update } from 'firebase/database';
 
 const HomePage = () => {
   const navigate = useNavigate();
   const [message, setMessage] = useState('');
   const [messages, setMessages] = useState([]);
-  const [users, setUsers] = useState([]);
+  const [allUsers, setAllUsers] = useState([]);
+  const [chatUsers, setChatUsers] = useState([]);
   const [selectedUser, setSelectedUser] = useState(null);
   const [showUserListModal, setShowUserListModal] = useState(false);
+  const [currentUser, setCurrentUser] = useState(null);
+  const [unseenCounts, setUnseenCounts] = useState({});
+  const messageListRef = useRef(null);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      if (!user) navigate('/');
+      else setCurrentUser(user);
+    });
+    return () => unsubscribe();
+  }, [navigate]);
+
+  useEffect(() => {
+    if (!currentUser) return;
+
+    const currentUid = currentUser.uid;
+    const usersRef = ref(database, 'users');
+
+    onValue(usersRef, (snapshot) => {
+      const data = snapshot.val() || {};
+      const all = [];
+      for (let id in data) {
+        if (id !== currentUid) {
+          all.push({ uid: id, ...data[id] });
+        }
+      }
+      setAllUsers(all);
+    });
+
+    const chatsRef = ref(database, 'chats');
+    onValue(chatsRef, (snapshot) => {
+      const chats = snapshot.val() || {};
+      const chattedUids = new Set();
+
+      Object.keys(chats).forEach((chatId) => {
+        const [uid1, uid2] = chatId.split('_');
+        if (uid1 === currentUid) chattedUids.add(uid2);
+        else if (uid2 === currentUid) chattedUids.add(uid1);
+      });
+
+      const usersRef = ref(database, 'users');
+      onValue(usersRef, (snap) => {
+        const usersData = snap.val() || {};
+        const chatted = [];
+
+        chattedUids.forEach((uid) => {
+          if (usersData[uid]) {
+            chatted.push({ uid, ...usersData[uid] });
+          }
+        });
+
+        setChatUsers(chatted);
+      });
+
+      // UNSEEN COUNT LOGIC
+      const updatedCounts = {};
+      Object.entries(chats).forEach(([chatId, chatMessages]) => {
+        const [uid1, uid2] = chatId.split('_');
+        if (uid1 !== currentUid && uid2 !== currentUid) return;
+
+        const otherUid = uid1 === currentUid ? uid2 : uid1;
+        let count = 0;
+        Object.values(chatMessages).forEach((msg) => {
+          if (msg.sender === otherUid && !msg.seen) {
+            count++;
+          }
+        });
+        if (count > 0) {
+          updatedCounts[otherUid] = count;
+        }
+      });
+
+      setUnseenCounts(updatedCounts);
+    });
+  }, [currentUser]);
 
   const logout = () => {
     signOut(auth);
     navigate('/');
   };
 
-  const getChatId = (uid1, uid2) => (uid1 < uid2 ? `${uid1}_${uid2}` : `${uid2}_${uid1}`);
+  const getChatId = (uid1, uid2) =>
+    uid1 < uid2 ? `${uid1}_${uid2}` : `${uid2}_${uid1}`;
 
-  // Send message
   const sendMessage = () => {
     if (message.trim() === '' || !selectedUser) return;
 
-    const chatId = getChatId(auth.currentUser.uid, selectedUser.uid);
+    const chatId = getChatId(currentUser.uid, selectedUser.uid);
     const messagesRef = ref(database, `chats/${chatId}`);
     push(messagesRef, {
       text: message,
-      sender: auth.currentUser.uid,
-      senderEmail: auth.currentUser.email,
+      sender: currentUser.uid,
+      senderEmail: currentUser.email,
       receiver: selectedUser.uid,
       timestamp: new Date().toISOString(),
+      seen: false,
     });
     setMessage('');
   };
 
-  // Load users except current
   useEffect(() => {
-    const usersRef = ref(database, 'users');
-    onValue(usersRef, (snapshot) => {
-      const data = snapshot.val() || {};
-      const userList = [];
-      for (let id in data) {
-        if (id !== auth.currentUser.uid) {
-       userList.push({ uid: id, ...data[id] }); // 🔁 include full user data
-        }
-      }
-      setUsers(userList);
-    });
-  }, []);
+    if (!selectedUser || !currentUser) return;
 
-  // Load messages for selected user
-  useEffect(() => {
-    if (!selectedUser) return;
-    const chatId = getChatId(auth.currentUser.uid, selectedUser.uid);
+    const chatId = getChatId(currentUser.uid, selectedUser.uid);
     const messagesRef = ref(database, `chats/${chatId}`);
+
+    // Listen to messages
     const unsubscribe = onValue(messagesRef, (snapshot) => {
       const data = snapshot.val() || {};
       const msgList = Object.keys(data).map((id) => ({ id, ...data[id] }));
       msgList.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
       setMessages(msgList);
+
+      // Mark all messages from selectedUser as seen
+      const updates = {};
+      msgList.forEach((msg) => {
+        if (msg.sender === selectedUser.uid && !msg.seen) {
+             updates[`chats/${chatId}/${msg.id}/seen`] = true;  // <-- FIXED PATH HERE
+        }
+      });
+      if (Object.keys(updates).length > 0) {
+        update(ref(database), updates);
+      }
+
+      // Scroll to bottom
+      setTimeout(() => {
+        if (messageListRef.current) {
+          messageListRef.current.scrollTop = messageListRef.current.scrollHeight;
+        }
+      }, 100);
     });
+
     return () => unsubscribe();
-  }, [selectedUser]);
+  }, [selectedUser, currentUser]);
+
+  // Format timestamp helper (e.g. "Jul 18, 3:15 PM")
+  const formatTimestamp = (isoString) => {
+    const date = new Date(isoString);
+    return date.toLocaleString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  };
 
   return (
     <>
       <div style={styles.container}>
-        {/* Sidebar */}
         <aside style={styles.sidebar}>
           <div style={styles.sidebarHeader}>
-            <h2>CloudChat</h2>
+            <div style={styles.currentUserInfo}>
+              <div style={styles.currentUserAvatar}>
+                {currentUser?.displayName?.[0]?.toUpperCase() || 'U'}
+              </div>
+              <div style={styles.currentUserName}>
+                {currentUser?.displayName || 'Unknown User'}
+              </div>
+            </div>
             <button onClick={logout} style={styles.logoutBtn} title="Logout">
               Logout
             </button>
           </div>
+
           <div style={styles.userList}>
-            {users.map((user) => (
+            {chatUsers.map((user) => (
               <div
                 key={user.uid}
                 style={{
                   ...styles.userListItem,
-                  backgroundColor: selectedUser?.uid === user.uid ? '#DCF8C6' : 'transparent',
+                  backgroundColor:
+                    selectedUser?.uid === user.uid ? '#DCF8C6' : 'transparent',
                 }}
                 onClick={() => setSelectedUser(user)}
               >
-                <div style={styles.userAvatar}>{user.email[0].toUpperCase()}</div>
-                <div style={styles.userEmail}>{user.email}</div>
+                <div style={styles.userAvatar}>
+                  {user.name?.[0]?.toUpperCase() || '?'}
+                </div>
+                <div style={styles.userEmail}>{user.name}</div>
+                {unseenCounts[user.uid] > 0 && (
+                  <div style={styles.notificationBadge}>
+                    {unseenCounts[user.uid]}
+                  </div>
+                )}
               </div>
             ))}
           </div>
         </aside>
 
-        {/* Chat area */}
         <main style={styles.chatArea}>
           {selectedUser ? (
             <>
               <header style={styles.chatHeader}>
-                <div style={styles.chatUserAvatar}>{selectedUser.email[0].toUpperCase()}</div>
-                <h3>{selectedUser.email}</h3>
+                <div style={styles.chatUserAvatar}>
+                  {selectedUser.name[0].toUpperCase()}
+                </div>
+                <h3>{selectedUser.name}</h3>
               </header>
 
-              <div style={styles.messageList} id="messageList">
+              <div style={styles.messageList} id="messageList" ref={messageListRef}>
                 {messages.map((msg) => {
-                  const isCurrentUser = msg.sender === auth.currentUser.uid;
+                  const isCurrentUser = msg.sender === currentUser.uid;
                   return (
                     <div
                       key={msg.id}
@@ -111,13 +221,18 @@ const HomePage = () => {
                         ...styles.messageBubble,
                         alignSelf: isCurrentUser ? 'flex-end' : 'flex-start',
                         backgroundColor: isCurrentUser ? '#DCF8C6' : '#FFF',
-                        color: '#000',
+                        position: 'relative',
                       }}
                     >
                       <div style={styles.messageText}>{msg.text}</div>
                       <div style={styles.messageTime}>
-                        {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        {formatTimestamp(msg.timestamp)}
                       </div>
+                      {isCurrentUser && (
+                        <div style={styles.readStatus}>
+                          {msg.seen ? '✓✓' : '✓'}
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -142,7 +257,6 @@ const HomePage = () => {
           )}
         </main>
 
-        {/* Floating new chat button */}
         <button
           style={styles.newChatButton}
           title="New Chat"
@@ -152,13 +266,18 @@ const HomePage = () => {
         </button>
       </div>
 
-      {/* Modal to select user to chat with */}
       {showUserListModal && (
-        <div style={styles.modalBackdrop} onClick={() => setShowUserListModal(false)}>
-          <div style={styles.modalContent} onClick={(e) => e.stopPropagation()}>
+        <div
+          style={styles.modalBackdrop}
+          onClick={() => setShowUserListModal(false)}
+        >
+          <div
+            style={styles.modalContent}
+            onClick={(e) => e.stopPropagation()}
+          >
             <h3>Select User to Chat</h3>
             <div style={styles.modalUserList}>
-              {users.map((user) => (
+              {allUsers.map((user) => (
                 <div
                   key={user.uid}
                   style={styles.modalUserItem}
@@ -167,7 +286,7 @@ const HomePage = () => {
                     setShowUserListModal(false);
                   }}
                 >
-                  {user.email}
+                  {user.name}
                 </div>
               ))}
             </div>
@@ -191,6 +310,19 @@ const styles = {
     fontFamily: "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif",
     backgroundColor: '#ECE5DD',
     position: 'relative',
+  },
+  notificationBadge: {
+    backgroundColor: 'red',
+    color: 'white',
+    fontSize: '12px',
+    minWidth: '18px',
+    height: '18px',
+    borderRadius: '50%',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: '2px 6px',
+    marginLeft: 'auto',
   },
   sidebar: {
     width: '280px',
@@ -294,11 +426,40 @@ const styles = {
     color: '#999',
     textAlign: 'right',
   },
+  readStatus: {
+    position: 'absolute',
+    bottom: '5px',
+    right: '8px',
+    fontSize: '12px',
+    color: '#666',
+  },
   chatFooter: {
     display: 'flex',
     padding: '10px 15px',
     borderTop: '1px solid #ddd',
     backgroundColor: '#fff',
+  },
+  currentUserInfo: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '10px',
+  },
+  currentUserAvatar: {
+    width: '40px',
+    height: '40px',
+    borderRadius: '50%',
+    backgroundColor: '#128C7E',
+    color: 'white',
+    display: 'flex',
+    justifyContent: 'center',
+    alignItems: 'center',
+    fontWeight: 'bold',
+    fontSize: '18px',
+  },
+  currentUserName: {
+    fontSize: '16px',
+    fontWeight: '500',
+    color: '#333',
   },
   messageInput: {
     flex: 1,
